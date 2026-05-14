@@ -272,30 +272,6 @@ def assign_chunk_ids(words_data, paragraph_gap_factor=1.8):
 	return words_data
 
 
-def group_word_ranges_by_chunk_id(words_data):
-	"""Return [(start, end), ...] index ranges for each chunk_id."""
-	if not words_data:
-		return []
-	ranges = []
-	chunk_start = 0
-	current_chunk = words_data[0].get("chunk_id", 0)
-	for idx in range(1, len(words_data)):
-		chunk_id = words_data[idx].get("chunk_id", 0)
-		if chunk_id != current_chunk:
-			ranges.append((chunk_start, idx))
-			chunk_start = idx
-			current_chunk = chunk_id
-	ranges.append((chunk_start, len(words_data)))
-	return ranges
-
-
-def chunk_compare_text(words_data, start, end, case_insensitive, ignore_quotes):
-	return " ".join(
-		normalize_token(words_data[i]["text"], case_insensitive, ignore_quotes)
-		for i in range(start, end)
-	)
-
-
 def apply_opcodes_to_words(words_data1, words_data2, opcodes, with_moves=False, reset=True, id_counter_start=0):
 	"""Map diff opcodes to highlight colors and sync-scroll ids (index-based)."""
 	if reset:
@@ -454,10 +430,13 @@ def build_change_records(
 	case_insensitive=True,
 	ignore_quotes=True,
 	compare_options=None,
+	group_by_chunk=True,
 ):
 	"""
 	Build structured change records from aligned word lists.
 	Returns a dict suitable for JSON export and agent consumption.
+	Alignment is always full-document; group_by_chunk only affects how
+	added/deleted/modified hunks are paired in the export.
 	"""
 	pair_move_ids(words_left, words_right, case_insensitive, ignore_quotes)
 
@@ -497,26 +476,14 @@ def build_change_records(
 		})
 		change_counter += 1
 
-	# Per-chunk red/green pairing for modified / deleted / added
-	all_chunk_ids = sorted({
-		w.get("chunk_id", 0) for w in words_left + words_right
-	})
-	for chunk_id in all_chunk_ids:
-		left_red = [
-			h for h in _collect_color_hunks(words_left, "red")
-			if words_left[h["start"]].get("chunk_id", 0) == chunk_id
-		]
-		right_green = [
-			h for h in _collect_color_hunks(words_right, "green")
-			if words_right[h["start"]].get("chunk_id", 0) == chunk_id
-		]
+	def append_red_green_changes(left_red, right_green, chunk_id=None):
+		nonlocal change_counter
 		pairs = min(len(left_red), len(right_green))
 		for i in range(pairs):
 			lh, rh = left_red[i], right_green[i]
-			changes.append({
+			entry = {
 				"id": f"chg-{change_counter:04d}",
 				"type": "modified",
-				"chunk_id": chunk_id,
 				"left_text": _words_to_text(words_left, lh["start"], lh["end"]),
 				"right_text": _words_to_text(words_right, rh["start"], rh["end"]),
 				"left_location": _location_from_words(words_left, lh["start"], lh["end"]),
@@ -525,13 +492,15 @@ def build_change_records(
 				"right_word_range": [rh["start"], rh["end"]],
 				"context_before": _context_snippet(words_left, lh["start"], -1),
 				"context_after": _context_snippet(words_left, lh["end"], 1),
-			})
+			}
+			if chunk_id is not None:
+				entry["chunk_id"] = chunk_id
+			changes.append(entry)
 			change_counter += 1
 		for lh in left_red[pairs:]:
-			changes.append({
+			entry = {
 				"id": f"chg-{change_counter:04d}",
 				"type": "deleted",
-				"chunk_id": chunk_id,
 				"left_text": _words_to_text(words_left, lh["start"], lh["end"]),
 				"right_text": None,
 				"left_location": _location_from_words(words_left, lh["start"], lh["end"]),
@@ -540,13 +509,15 @@ def build_change_records(
 				"right_word_range": None,
 				"context_before": _context_snippet(words_left, lh["start"], -1),
 				"context_after": _context_snippet(words_left, lh["end"], 1),
-			})
+			}
+			if chunk_id is not None:
+				entry["chunk_id"] = chunk_id
+			changes.append(entry)
 			change_counter += 1
 		for rh in right_green[pairs:]:
-			changes.append({
+			entry = {
 				"id": f"chg-{change_counter:04d}",
 				"type": "added",
-				"chunk_id": chunk_id,
 				"left_text": None,
 				"right_text": _words_to_text(words_right, rh["start"], rh["end"]),
 				"left_location": None,
@@ -555,8 +526,31 @@ def build_change_records(
 				"right_word_range": [rh["start"], rh["end"]],
 				"context_before": _context_snippet(words_right, rh["start"], -1),
 				"context_after": _context_snippet(words_right, rh["end"], 1),
-			})
+			}
+			if chunk_id is not None:
+				entry["chunk_id"] = chunk_id
+			changes.append(entry)
 			change_counter += 1
+
+	if group_by_chunk:
+		all_chunk_ids = sorted({
+			w.get("chunk_id", 0) for w in words_left + words_right
+		})
+		for chunk_id in all_chunk_ids:
+			left_red = [
+				h for h in _collect_color_hunks(words_left, "red")
+				if words_left[h["start"]].get("chunk_id", 0) == chunk_id
+			]
+			right_green = [
+				h for h in _collect_color_hunks(words_right, "green")
+				if words_right[h["start"]].get("chunk_id", 0) == chunk_id
+			]
+			append_red_green_changes(left_red, right_green, chunk_id=chunk_id)
+	else:
+		append_red_green_changes(
+			_collect_color_hunks(words_left, "red"),
+			_collect_color_hunks(words_right, "green"),
+		)
 
 	# Sort changes by left location (fallback to right) for document order
 	def sort_key(chg):
@@ -588,9 +582,33 @@ def build_change_records(
 
 def write_change_records_json(records, output_path):
 	"""Write change records to a JSON file."""
+	output_path = os.path.abspath(output_path)
+	os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+	payload = dict(records)
+	payload["export_path"] = output_path
 	with open(output_path, "w", encoding="utf-8") as f:
-		json.dump(records, f, ensure_ascii=False, indent=2)
+		json.dump(payload, f, ensure_ascii=False, indent=2)
 	print(f"Change records written to: {output_path}")
+	return output_path
+
+
+def _sanitize_filename_part(name):
+	"""Make a string safe for use in a filename (Windows-compatible)."""
+	clean = re.sub(r'[<>:"/\\|?*]', "_", name).strip()
+	return clean or "document"
+
+
+def default_change_records_json_path(left_name, right_name):
+	"""Default auto-export path under temp_pdfs/."""
+	n1 = _sanitize_filename_part(os.path.splitext(left_name or "left")[0])
+	n2 = _sanitize_filename_part(os.path.splitext(right_name or "right")[0])
+	return os.path.join(TEMP_PDF_DIR, f"{n1}_vs_{n2}_changes.json")
+
+
+def auto_save_change_records(records, left_name, right_name):
+	"""Write change records JSON to the default export path."""
+	path = default_change_records_json_path(left_name, right_name)
+	return write_change_records_json(records, path)
 
 
 def compare_files_to_change_records(
@@ -634,7 +652,7 @@ def compare_files_to_change_records(
 			"ignore_ligatures": ignore_ligatures,
 			"split_punctuation": split_punctuation,
 			"merge_hyphenation": merge_hyphenation,
-			"use_chunked": use_chunked,
+			"group_by_chunk": use_chunked,
 			"aligner": "git" if _git_available else "difflib",
 		}
 		return build_change_records(
@@ -644,6 +662,7 @@ def compare_files_to_change_records(
 			case_insensitive=case_insensitive,
 			ignore_quotes=ignore_quotes,
 			compare_options=compare_options,
+			group_by_chunk=use_chunked,
 		)
 	finally:
 		doc_left.close()
@@ -1411,89 +1430,6 @@ def get_word_level_opcodes(a_compare, b_compare):
 	return [(*opcode, False) for opcode in s.get_opcodes()], False
 
 
-def align_word_range(words_data1, words_data2, s1, e1, s2, e2, case_insensitive, ignore_quotes, id_counter):
-	"""Run word-level alignment on index ranges within two word lists."""
-	sub1 = words_data1[s1:e1]
-	sub2 = words_data2[s2:e2]
-	if not sub1 and not sub2:
-		return id_counter
-	a_compare, b_compare = helper_case_quotes(sub1, sub2, case_insensitive, ignore_quotes)
-	raw_opcodes, with_moves = get_word_level_opcodes(a_compare, b_compare)
-	global_opcodes = []
-	for op in raw_opcodes:
-		if with_moves:
-			tag, i1, i2, j1, j2, is_moved = op
-			global_opcodes.append((tag, s1 + i1, s1 + i2, s2 + j1, s2 + j2, is_moved))
-		else:
-			tag, i1, i2, j1, j2 = op[:5]
-			global_opcodes.append((tag, s1 + i1, s1 + i2, s2 + j1, s2 + j2))
-	_, _, id_counter = apply_opcodes_to_words(
-		words_data1, words_data2, global_opcodes,
-		with_moves=with_moves, reset=False, id_counter_start=id_counter,
-	)
-	return id_counter
-
-
-def align_words_chunked(words_data1, words_data2, case_insensitive, ignore_quotes):
-	"""Two-pass diff: align paragraph chunks, then word-diff inside each matched pair."""
-	chunks1 = group_word_ranges_by_chunk_id(words_data1)
-	chunks2 = group_word_ranges_by_chunk_id(words_data2)
-	if len(chunks1) <= 1 and len(chunks2) <= 1:
-		return align_words_single_pass(words_data1, words_data2, case_insensitive, ignore_quotes)
-
-	sigs1 = [chunk_compare_text(words_data1, s, e, case_insensitive, ignore_quotes) for s, e in chunks1]
-	sigs2 = [chunk_compare_text(words_data2, s, e, case_insensitive, ignore_quotes) for s, e in chunks2]
-	chunk_matcher = difflib.SequenceMatcher(None, sigs1, sigs2)
-	id_counter = 0
-
-	for w in words_data1:
-		w["unique_id"] = None
-		w["highlight_color"] = None
-	for w in words_data2:
-		w["unique_id"] = None
-		w["highlight_color"] = None
-
-	for tag, i1, i2, j1, j2 in chunk_matcher.get_opcodes():
-		if tag == "equal":
-			for offset in range(i2 - i1):
-				s1, e1 = chunks1[i1 + offset]
-				s2, e2 = chunks2[j1 + offset]
-				id_counter = align_word_range(
-					words_data1, words_data2, s1, e1, s2, e2,
-					case_insensitive, ignore_quotes, id_counter,
-				)
-		elif tag == "delete":
-			for ci in range(i1, i2):
-				start, end = chunks1[ci]
-				for idx in range(start, end):
-					words_data1[idx]["highlight_color"] = "red"
-		elif tag == "insert":
-			for cj in range(j1, j2):
-				start, end = chunks2[cj]
-				for idx in range(start, end):
-					words_data2[idx]["highlight_color"] = "green"
-		elif tag == "replace":
-			left_count = i2 - i1
-			right_count = j2 - j1
-			pairs = min(left_count, right_count)
-			for k in range(pairs):
-				s1, e1 = chunks1[i1 + k]
-				s2, e2 = chunks2[j1 + k]
-				id_counter = align_word_range(
-					words_data1, words_data2, s1, e1, s2, e2,
-					case_insensitive, ignore_quotes, id_counter,
-				)
-			for ci in range(i1 + pairs, i2):
-				start, end = chunks1[ci]
-				for idx in range(start, end):
-					words_data1[idx]["highlight_color"] = "red"
-			for cj in range(j1 + pairs, j2):
-				start, end = chunks2[cj]
-				for idx in range(start, end):
-					words_data2[idx]["highlight_color"] = "green"
-	return words_data1, words_data2
-
-
 def align_words_single_pass(words_data1, words_data2, case_insensitive, ignore_quotes):
 	"""Single-pass word alignment using git diff or difflib."""
 	a_compare, b_compare = helper_case_quotes(words_data1, words_data2, case_insensitive, ignore_quotes)
@@ -1505,9 +1441,11 @@ def align_words_single_pass(words_data1, words_data2, case_insensitive, ignore_q
 
 
 def align_words(words_data1, words_data2, case_insensitive, ignore_quotes, use_chunked=True):
-	"""Align two documents at word level, optionally using chunk-then-word diff."""
-	if use_chunked:
-		return align_words_chunked(words_data1, words_data2, case_insensitive, ignore_quotes)
+	"""
+	Align two documents with one full-document word diff.
+	use_chunked is accepted for API compatibility; chunk boundaries are
+	assigned at extraction and used only when grouping export change records.
+	"""
 	return align_words_single_pass(words_data1, words_data2, case_insensitive, ignore_quotes)
 
 
@@ -2196,6 +2134,7 @@ class PDFViewerApp:
 		self._compare_thread = None
 		self.words_data_original = [None, None]
 		self.change_records = None
+		self.change_records_path = None
 
 	def setup_ui(self):
 		"""Sets up the main application UI, including control frame and viewer panes."""
@@ -2227,6 +2166,10 @@ class PDFViewerApp:
 			control_frame, text="Export changes", command=self.export_change_records_dialog,
 		)
 		self.export_changes_button.pack(side=tk.LEFT, padx=5)
+		ToolTip(
+			self.export_changes_button,
+			"Save a copy of the change JSON. A file is auto-created in temp_pdfs/ after each compare.",
+		)
 		self.sync_scroll_checkbox = ttk.Checkbutton(control_frame, text="Sync Scroll",
 													variable=self.sync_scroll_enabled, onvalue=True, offvalue=False)
 		self.sync_scroll_checkbox.pack(side=tk.LEFT, padx=(20, 5))
@@ -2267,11 +2210,15 @@ class PDFViewerApp:
 		self.merge_hyphenation_checkbox.pack(side=tk.LEFT, padx=5)
 		ToolTip(self.merge_hyphenation_checkbox, "Merge line-break hyphenations when extracting. Reload files after changing.")
 		self.chunk_compare_checkbox = ttk.Checkbutton(
-			control_frame, text="Chunk diff",
+			control_frame, text="Group by chunk",
 			variable=self.chunk_compare, onvalue=True, offvalue=False,
 		)
 		self.chunk_compare_checkbox.pack(side=tk.LEFT, padx=5)
-		ToolTip(self.chunk_compare_checkbox, "Two-pass paragraph-then-word compare. Use Re-compare after changing.")
+		ToolTip(
+			self.chunk_compare_checkbox,
+			"Group exported change records by paragraph chunk. "
+			"Does not affect compare speed. Use Re-compare after changing.",
+		)
 		self.panes_container = ttk.Frame(self.master)
 		self.panes_container.pack(fill=tk.BOTH, expand=True)
 		self.pane1 = PDFViewerPane(self.panes_container, self, 'left')
@@ -2436,6 +2383,7 @@ class PDFViewerApp:
 				return
 		self._compare_in_progress = True
 		self.change_records = None
+		self.change_records_path = None
 		self.pane1.sorted = None
 		self.pane2.sorted = None
 		self.pane1.display_loading_message("Comparing...")
@@ -2500,20 +2448,30 @@ class PDFViewerApp:
 			"ignore_ligatures": self.ignore_ligatures.get(),
 			"split_punctuation": self.split_punctuation.get(),
 			"merge_hyphenation": self.merge_hyphenation.get(),
-			"use_chunked": self.chunk_compare.get(),
+			"group_by_chunk": self.chunk_compare.get(),
 			"aligner": "git" if _git_available else "difflib",
 		}
 
 	def _refresh_change_records(self, words_left, words_right):
-		"""Build structured change records after a successful compare."""
+		"""Build structured change records and auto-export JSON after compare."""
+		left_name = self.pane1.file_name or "left"
+		right_name = self.pane2.file_name or "right"
 		self.change_records = build_change_records(
 			words_left, words_right,
-			left_name=self.pane1.file_name or "left",
-			right_name=self.pane2.file_name or "right",
+			left_name=left_name,
+			right_name=right_name,
 			case_insensitive=self.case_insensitive.get(),
 			ignore_quotes=self.ignore_quotes.get(),
 			compare_options=self._compare_options_dict(),
+			group_by_chunk=self.chunk_compare.get(),
 		)
+		try:
+			self.change_records_path = auto_save_change_records(
+				self.change_records, left_name, right_name,
+			)
+		except Exception as e:
+			self.change_records_path = None
+			print(f"Warning: could not auto-save change records JSON: {e}", file=sys.stderr)
 		print(
 			f"Change records: {self.change_records['stats']['total']} hunks "
 			f"({self.change_records['stats']['added']} added, "
@@ -2521,9 +2479,11 @@ class PDFViewerApp:
 			f"{self.change_records['stats']['modified']} modified, "
 			f"{self.change_records['stats']['moved']} moved)"
 		)
+		if self.change_records_path:
+			print(f"Change records JSON: {self.change_records_path}")
 
 	def export_change_records_dialog(self):
-		"""Save change records JSON for agent / reporting use."""
+		"""Save a copy of change records JSON (auto-export already wrote the default file)."""
 		if not self.change_records:
 			messagebox.showinfo("Export Changes", "No comparison results to export. Compare two documents first.")
 			return
@@ -2534,11 +2494,16 @@ class PDFViewerApp:
 			defaultextension=".json",
 			filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
 			initialfile=initial,
+			initialdir=TEMP_PDF_DIR,
 		)
 		if file_path:
 			try:
 				write_change_records_json(self.change_records, file_path)
-				messagebox.showinfo("Export Changes", f"Change records saved to:\n{file_path}")
+				messagebox.showinfo(
+					"Export Changes",
+					f"Change records saved to:\n{file_path}"
+					+ (f"\n\n(Auto-export remains at:\n{self.change_records_path})" if self.change_records_path else ""),
+				)
 			except Exception as e:
 				messagebox.showerror("Export Changes", f"Failed to save change records:\n{e}")
 
