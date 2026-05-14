@@ -1,9 +1,12 @@
 # -*- coding: UTF-8 -*-
 import difflib
+import html
 import inspect
+import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,8 +14,8 @@ import threading
 import time
 import tkinter as tk
 import traceback
+import unicodedata
 from collections import defaultdict
-from idlelib.tooltip import Hovertip
 from tkinter import ttk, filedialog, messagebox
 
 import fitz
@@ -73,6 +76,580 @@ try:
 	windll.user32.SetThreadDpiAwarenessContext(wintypes.HANDLE(-2))
 except AttributeError:
 	pass
+
+
+class ToolTip:
+	"""Lightweight tooltip replacement (does not depend on idlelib)."""
+
+	def __init__(self, widget, text):
+		self.widget = widget
+		self.text = text
+		self.tip_window = None
+		widget.bind("<Enter>", self._show)
+		widget.bind("<Leave>", self._hide)
+
+	def _show(self, _event=None):
+		if self.tip_window:
+			return
+		x = self.widget.winfo_rootx() + 20
+		y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+		self.tip_window = tw = tk.Toplevel(self.widget)
+		tw.wm_overrideredirect(True)
+		tw.wm_geometry(f"+{x}+{y}")
+		label = tk.Label(
+			tw, text=self.text, justify=tk.LEFT,
+			background="#ffffe0", relief=tk.SOLID, borderwidth=1,
+			font=("TkDefaultFont", 9),
+		)
+		label.pack()
+
+	def _hide(self, _event=None):
+		if self.tip_window:
+			self.tip_window.destroy()
+			self.tip_window = None
+
+
+def find_git_executable():
+	"""Resolve git: bundled PortableGit next to the app/exe, then PATH."""
+	if getattr(sys, "frozen", False):
+		base = os.path.dirname(sys.executable)
+	else:
+		base = os.path.dirname(os.path.abspath(__file__))
+	for rel in (
+		os.path.join("git", "cmd", "git.exe"),
+		os.path.join("PortableGit", "cmd", "git.exe"),
+		os.path.join("mingw64", "bin", "git.exe"),
+		os.path.join("cmd", "git.exe"),
+	):
+		candidate = os.path.join(base, rel)
+		if os.path.isfile(candidate):
+			return candidate
+	found = shutil.which("git")
+	return found if found else "git"
+
+
+def normalize_token(text, case_insensitive, ignore_quotes):
+	"""Normalize a single token for comparison."""
+	t = unicodedata.normalize("NFKC", text)
+	t = t.replace("\u00a0", " ").replace("\u200b", "").replace("\u00ad", "")
+	if ignore_quotes:
+		t = (
+			t.replace("\u2018", "'").replace("\u2019", "'").replace("\u02bc", "'")
+			.replace("\u201c", '"').replace("\u201d", '"')
+		)
+	if case_insensitive:
+		t = t.casefold()
+	return t
+
+
+LEADING_PUNCTUATION = "([{\"'"
+TRAILING_PUNCTUATION = ".,;:!?)]}'\""
+
+
+def _split_bbox_for_segments(x0, y0, x1, y1, segments):
+	"""Split a word bounding box proportionally by character count."""
+	total_len = sum(len(s) for s in segments)
+	if total_len == 0:
+		return [(x0, y0, x1, y1)] * len(segments)
+	width = x1 - x0
+	rects = []
+	cursor = x0
+	for segment in segments:
+		seg_width = width * (len(segment) / total_len)
+		rects.append((cursor, y0, cursor + seg_width, y1))
+		cursor += seg_width
+	rects[-1] = (rects[-1][0], y0, x1, y1)
+	return rects
+
+
+def split_word_punctuation(word_dict):
+	"""Split a word into core text and attached punctuation tokens."""
+	text = word_dict["text"]
+	if not text or len(text) == 1:
+		return [word_dict]
+
+	lead_len = 0
+	while lead_len < len(text) and text[lead_len] in LEADING_PUNCTUATION:
+		lead_len += 1
+	rest = text[lead_len:]
+	trail_len = 0
+	while trail_len < len(rest) and rest[len(rest) - 1 - trail_len] in TRAILING_PUNCTUATION:
+		trail_len += 1
+	core = rest[: len(rest) - trail_len] if trail_len else rest
+	trail = rest[len(rest) - trail_len :] if trail_len else ""
+
+	segments = []
+	if lead_len:
+		segments.append(text[:lead_len])
+	if core:
+		segments.append(core)
+	if trail:
+		segments.append(trail)
+	if len(segments) <= 1:
+		return [word_dict]
+
+	x0, y0, x1, y1 = word_dict["x0"], word_dict["y0"], word_dict["x1"], word_dict["y1"]
+	rects = _split_bbox_for_segments(x0, y0, x1, y1, segments)
+	result = []
+	for segment, rect in zip(segments, rects):
+		new_word = dict(word_dict)
+		new_word["text"] = segment
+		new_word["x0"], new_word["y0"], new_word["x1"], new_word["y1"] = rect
+		result.append(new_word)
+	return result
+
+
+def merge_hyphenated_line_breaks(page_words):
+	"""Merge words split across lines by a trailing hyphen or soft hyphen."""
+	if not page_words:
+		return page_words
+
+	merged = []
+	i = 0
+	while i < len(page_words):
+		current = page_words[i]
+		if i + 1 < len(page_words):
+			nxt = page_words[i + 1]
+			current_text = current["text"]
+			ends_hyphen = current_text.endswith("-") or current_text.endswith("\u00ad")
+			same_block = current.get("block_idx") == nxt.get("block_idx")
+			next_line = nxt.get("line_idx", 0) > current.get("line_idx", 0)
+			vertical_gap = nxt["y0"] - current["y1"]
+			line_height = max(current.get("font_size", 12.0), 1.0)
+			close_lines = 0 <= vertical_gap <= line_height * 1.5
+			if ends_hyphen and same_block and next_line and close_lines:
+				strip_char = "\u00ad" if current_text.endswith("\u00ad") else "-"
+				combined = dict(current)
+				combined["text"] = current_text[: -len(strip_char)] + nxt["text"]
+				combined["x0"] = min(current["x0"], nxt["x0"])
+				combined["y0"] = min(current["y0"], nxt["y0"])
+				combined["x1"] = max(current["x1"], nxt["x1"])
+				combined["y1"] = max(current["y1"], nxt["y1"])
+				merged.append(combined)
+				i += 2
+				continue
+		merged.append(current)
+		i += 1
+	return merged
+
+
+def postprocess_page_words(page_words, split_punctuation=True, merge_hyphenation=True):
+	"""Apply hyphenation merge and punctuation splitting to one page of words."""
+	words = merge_hyphenated_line_breaks(page_words) if merge_hyphenation else list(page_words)
+	result = []
+	for word in words:
+		if split_punctuation:
+			result.extend(split_word_punctuation(word))
+		else:
+			result.append(word)
+	return result
+
+
+def assign_chunk_ids(words_data, paragraph_gap_factor=1.8):
+	"""Assign chunk_id boundaries using page/block changes and paragraph gaps."""
+	if not words_data:
+		return words_data
+	chunk_id = 0
+	prev = None
+	for word in words_data:
+		if prev is None:
+			word["chunk_id"] = chunk_id
+		else:
+			new_chunk = False
+			if word["page_num"] != prev["page_num"]:
+				new_chunk = True
+			elif word.get("block_idx") != prev.get("block_idx"):
+				new_chunk = True
+			else:
+				gap = word["y0"] - prev["y1"]
+				line_height = max(prev.get("font_size", 12.0), 1.0)
+				if gap > line_height * paragraph_gap_factor:
+					new_chunk = True
+			if new_chunk:
+				chunk_id += 1
+			word["chunk_id"] = chunk_id
+		prev = word
+	return words_data
+
+
+def group_word_ranges_by_chunk_id(words_data):
+	"""Return [(start, end), ...] index ranges for each chunk_id."""
+	if not words_data:
+		return []
+	ranges = []
+	chunk_start = 0
+	current_chunk = words_data[0].get("chunk_id", 0)
+	for idx in range(1, len(words_data)):
+		chunk_id = words_data[idx].get("chunk_id", 0)
+		if chunk_id != current_chunk:
+			ranges.append((chunk_start, idx))
+			chunk_start = idx
+			current_chunk = chunk_id
+	ranges.append((chunk_start, len(words_data)))
+	return ranges
+
+
+def chunk_compare_text(words_data, start, end, case_insensitive, ignore_quotes):
+	return " ".join(
+		normalize_token(words_data[i]["text"], case_insensitive, ignore_quotes)
+		for i in range(start, end)
+	)
+
+
+def apply_opcodes_to_words(words_data1, words_data2, opcodes, with_moves=False, reset=True, id_counter_start=0):
+	"""Map diff opcodes to highlight colors and sync-scroll ids (index-based)."""
+	if reset:
+		for w in words_data1:
+			w["unique_id"] = None
+			w["highlight_color"] = None
+			w["move_id"] = None
+			w["move_side"] = None
+		for w in words_data2:
+			w["unique_id"] = None
+			w["highlight_color"] = None
+			w["move_id"] = None
+			w["move_side"] = None
+
+	common_word_id_counter = id_counter_start
+	for op in opcodes:
+		if with_moves:
+			tag, i1, i2, j1, j2, is_moved = op
+		else:
+			tag, i1, i2, j1, j2 = op[:5]
+			is_moved = False
+
+		if tag == "equal":
+			for k in range(i2 - i1):
+				common_id = f"common-word-{common_word_id_counter}"
+				words_data1[i1 + k]["unique_id"] = common_id
+				words_data2[j1 + k]["unique_id"] = common_id
+				common_word_id_counter += 1
+		elif tag == "delete":
+			color = "blue" if is_moved else "red"
+			for k in range(i1, i2):
+				words_data1[k]["highlight_color"] = color
+		elif tag == "insert":
+			color = "blue" if is_moved else "green"
+			for k in range(j1, j2):
+				words_data2[k]["highlight_color"] = color
+		elif tag == "replace":
+			for k in range(i1, i2):
+				words_data1[k]["highlight_color"] = "red"
+			for k in range(j1, j2):
+				words_data2[k]["highlight_color"] = "green"
+	return words_data1, words_data2, common_word_id_counter
+
+
+def _words_to_text(words, start, end):
+	return " ".join(words[i]["text"] for i in range(start, end))
+
+
+def _hunk_signature(words, start, end, case_insensitive, ignore_quotes):
+	return " ".join(
+		normalize_token(words[i]["text"], case_insensitive, ignore_quotes)
+		for i in range(start, end)
+	)
+
+
+def _location_from_words(words, start, end):
+	first = words[start]
+	last = words[end - 1]
+	return {
+		"page": first["page_num"],
+		"chunk_id": first.get("chunk_id", 0),
+		"y0": first["y0"],
+		"y1": last["y1"],
+		"x0": min(words[i]["x0"] for i in range(start, end)),
+		"x1": max(words[i]["x1"] for i in range(start, end)),
+	}
+
+
+def _context_snippet(words, index, direction, max_words=20):
+	"""Return nearby unchanged words as context (before index if direction<0, after if >0)."""
+	parts = []
+	if direction < 0:
+		i = index - 1
+		while i >= 0 and len(parts) < max_words:
+			if not words[i].get("highlight_color"):
+				parts.insert(0, words[i]["text"])
+			elif parts:
+				break
+			i -= 1
+	else:
+		i = index
+		while i < len(words) and len(parts) < max_words:
+			if not words[i].get("highlight_color"):
+				parts.append(words[i]["text"])
+			elif parts:
+				break
+			i += 1
+	return " ".join(parts)
+
+
+def pair_move_ids(words_left, words_right, case_insensitive, ignore_quotes):
+	"""Assign shared move_id to paired blue (moved) hunks on left and right."""
+	for w in words_left:
+		w["move_id"] = None
+		w["move_side"] = None
+	for w in words_right:
+		w["move_id"] = None
+		w["move_side"] = None
+
+	def collect_blue_hunks(words):
+		hunks = []
+		i = 0
+		while i < len(words):
+			if words[i].get("highlight_color") != "blue":
+				i += 1
+				continue
+			start = i
+			while i < len(words) and words[i].get("highlight_color") == "blue":
+				i += 1
+			hunks.append({
+				"start": start,
+				"end": i,
+				"signature": _hunk_signature(words, start, i, case_insensitive, ignore_quotes),
+			})
+		return hunks
+
+	right_buckets = defaultdict(list)
+	for hunk in collect_blue_hunks(words_right):
+		right_buckets[hunk["signature"]].append(hunk)
+
+	move_counter = 0
+	for left_hunk in collect_blue_hunks(words_left):
+		bucket = right_buckets.get(left_hunk["signature"], [])
+		if not bucket:
+			continue
+		right_hunk = bucket.pop(0)
+		move_id = f"move-{move_counter}"
+		move_counter += 1
+		for idx in range(left_hunk["start"], left_hunk["end"]):
+			words_left[idx]["move_id"] = move_id
+			words_left[idx]["move_side"] = "from"
+		for idx in range(right_hunk["start"], right_hunk["end"]):
+			words_right[idx]["move_id"] = move_id
+			words_right[idx]["move_side"] = "to"
+
+
+def _collect_color_hunks(words, color):
+	hunks = []
+	i = 0
+	while i < len(words):
+		if words[i].get("highlight_color") != color:
+			i += 1
+			continue
+		start = i
+		while i < len(words) and words[i].get("highlight_color") == color:
+			i += 1
+		hunks.append({"start": start, "end": i, "color": color})
+	return hunks
+
+
+def build_change_records(
+	words_left,
+	words_right,
+	left_name="left",
+	right_name="right",
+	case_insensitive=True,
+	ignore_quotes=True,
+	compare_options=None,
+):
+	"""
+	Build structured change records from aligned word lists.
+	Returns a dict suitable for JSON export and agent consumption.
+	"""
+	pair_move_ids(words_left, words_right, case_insensitive, ignore_quotes)
+
+	changes = []
+	change_counter = 0
+	seen_move_ids = set()
+
+	# Moved hunks (paired by move_id)
+	move_groups = defaultdict(lambda: {"from": None, "to": None})
+	for side_key, words in (("from", words_left), ("to", words_right)):
+		for hunk in _collect_color_hunks(words, "blue"):
+			move_id = words[hunk["start"]].get("move_id")
+			if not move_id:
+				continue
+			move_groups[move_id][side_key] = hunk
+
+	for move_id, group in sorted(move_groups.items(), key=lambda x: x[0]):
+		if move_id in seen_move_ids:
+			continue
+		seen_move_ids.add(move_id)
+		left_hunk = group["from"]
+		right_hunk = group["to"]
+		left_text = _words_to_text(words_left, left_hunk["start"], left_hunk["end"]) if left_hunk else None
+		right_text = _words_to_text(words_right, right_hunk["start"], right_hunk["end"]) if right_hunk else None
+		loc_source = left_hunk or right_hunk
+		words_ref = words_left if left_hunk else words_right
+		changes.append({
+			"id": f"chg-{change_counter:04d}",
+			"type": "moved",
+			"move_id": move_id,
+			"left_text": left_text,
+			"right_text": right_text,
+			"left_location": _location_from_words(words_left, left_hunk["start"], left_hunk["end"]) if left_hunk else None,
+			"right_location": _location_from_words(words_right, right_hunk["start"], right_hunk["end"]) if right_hunk else None,
+			"context_before": _context_snippet(words_ref, loc_source["start"], -1) if loc_source else "",
+			"context_after": _context_snippet(words_ref, loc_source["end"], 1) if loc_source else "",
+		})
+		change_counter += 1
+
+	# Per-chunk red/green pairing for modified / deleted / added
+	all_chunk_ids = sorted({
+		w.get("chunk_id", 0) for w in words_left + words_right
+	})
+	for chunk_id in all_chunk_ids:
+		left_red = [
+			h for h in _collect_color_hunks(words_left, "red")
+			if words_left[h["start"]].get("chunk_id", 0) == chunk_id
+		]
+		right_green = [
+			h for h in _collect_color_hunks(words_right, "green")
+			if words_right[h["start"]].get("chunk_id", 0) == chunk_id
+		]
+		pairs = min(len(left_red), len(right_green))
+		for i in range(pairs):
+			lh, rh = left_red[i], right_green[i]
+			changes.append({
+				"id": f"chg-{change_counter:04d}",
+				"type": "modified",
+				"chunk_id": chunk_id,
+				"left_text": _words_to_text(words_left, lh["start"], lh["end"]),
+				"right_text": _words_to_text(words_right, rh["start"], rh["end"]),
+				"left_location": _location_from_words(words_left, lh["start"], lh["end"]),
+				"right_location": _location_from_words(words_right, rh["start"], rh["end"]),
+				"left_word_range": [lh["start"], lh["end"]],
+				"right_word_range": [rh["start"], rh["end"]],
+				"context_before": _context_snippet(words_left, lh["start"], -1),
+				"context_after": _context_snippet(words_left, lh["end"], 1),
+			})
+			change_counter += 1
+		for lh in left_red[pairs:]:
+			changes.append({
+				"id": f"chg-{change_counter:04d}",
+				"type": "deleted",
+				"chunk_id": chunk_id,
+				"left_text": _words_to_text(words_left, lh["start"], lh["end"]),
+				"right_text": None,
+				"left_location": _location_from_words(words_left, lh["start"], lh["end"]),
+				"right_location": None,
+				"left_word_range": [lh["start"], lh["end"]],
+				"right_word_range": None,
+				"context_before": _context_snippet(words_left, lh["start"], -1),
+				"context_after": _context_snippet(words_left, lh["end"], 1),
+			})
+			change_counter += 1
+		for rh in right_green[pairs:]:
+			changes.append({
+				"id": f"chg-{change_counter:04d}",
+				"type": "added",
+				"chunk_id": chunk_id,
+				"left_text": None,
+				"right_text": _words_to_text(words_right, rh["start"], rh["end"]),
+				"left_location": None,
+				"right_location": _location_from_words(words_right, rh["start"], rh["end"]),
+				"left_word_range": None,
+				"right_word_range": [rh["start"], rh["end"]],
+				"context_before": _context_snippet(words_right, rh["start"], -1),
+				"context_after": _context_snippet(words_right, rh["end"], 1),
+			})
+			change_counter += 1
+
+	# Sort changes by left location (fallback to right) for document order
+	def sort_key(chg):
+		loc = chg.get("left_location") or chg.get("right_location") or {}
+		return (loc.get("page", 0), loc.get("chunk_id", 0), loc.get("y0", 0.0))
+
+	changes.sort(key=sort_key)
+	for i, chg in enumerate(changes):
+		chg["id"] = f"chg-{i:04d}"
+
+	stats = {
+		"added": sum(1 for c in changes if c["type"] == "added"),
+		"deleted": sum(1 for c in changes if c["type"] == "deleted"),
+		"modified": sum(1 for c in changes if c["type"] == "modified"),
+		"moved": sum(1 for c in changes if c["type"] == "moved"),
+		"total": len(changes),
+		"unchanged_words": sum(1 for w in words_left if not w.get("highlight_color")),
+	}
+
+	return {
+		"version": 1,
+		"left_document": left_name,
+		"right_document": right_name,
+		"compare_options": compare_options or {},
+		"stats": stats,
+		"changes": changes,
+	}
+
+
+def write_change_records_json(records, output_path):
+	"""Write change records to a JSON file."""
+	with open(output_path, "w", encoding="utf-8") as f:
+		json.dump(records, f, ensure_ascii=False, indent=2)
+	print(f"Change records written to: {output_path}")
+
+
+def compare_files_to_change_records(
+	left_path,
+	right_path,
+	case_insensitive=True,
+	ignore_quotes=True,
+	ignore_ligatures=True,
+	split_punctuation=True,
+	merge_hyphenation=True,
+	use_chunked=True,
+):
+	"""Headless: open two files, align, and return change records dict."""
+	left_path = os.path.abspath(left_path)
+	right_path = os.path.abspath(right_path)
+	doc_left = fitz.open(left_path)
+	doc_right = fitz.open(right_path)
+	try:
+		words_left = extract_words_with_styles(
+			doc_left,
+			ignore_ligatures=ignore_ligatures,
+			split_punctuation=split_punctuation,
+			merge_hyphenation=merge_hyphenation,
+		)
+		words_right = extract_words_with_styles(
+			doc_right,
+			ignore_ligatures=ignore_ligatures,
+			split_punctuation=split_punctuation,
+			merge_hyphenation=merge_hyphenation,
+		)
+		words_left = [dict(w) for w in words_left]
+		words_right = [dict(w) for w in words_right]
+		words_left, words_right = align_words(
+			words_left, words_right,
+			case_insensitive, ignore_quotes,
+			use_chunked=use_chunked,
+		)
+		compare_options = {
+			"case_insensitive": case_insensitive,
+			"ignore_quotes": ignore_quotes,
+			"ignore_ligatures": ignore_ligatures,
+			"split_punctuation": split_punctuation,
+			"merge_hyphenation": merge_hyphenation,
+			"use_chunked": use_chunked,
+			"aligner": "git" if _git_available else "difflib",
+		}
+		return build_change_records(
+			words_left, words_right,
+			left_name=os.path.basename(left_path),
+			right_name=os.path.basename(right_path),
+			case_insensitive=case_insensitive,
+			ignore_quotes=ignore_quotes,
+			compare_options=compare_options,
+		)
+	finally:
+		doc_left.close()
+		doc_right.close()
+
+
 def convert_clipboard_to_pdf(output_filename="clipboard_content.pdf"):
 	"""
 	Converts the HTML content from the clipboard to a PDF.
@@ -121,19 +698,20 @@ def convert_clipboard_to_pdf(output_filename="clipboard_content.pdf"):
 			flags=re.DOTALL | re.IGNORECASE # DOTALL to match across newlines, IGNORECASE for 'style' itself
 		)
 	elif plain_text_content:
+		escaped = html.escape(plain_text_content)
 		content_to_use = f"""
 		<html>
 		<head>
 			<style>
 				body {{
-					font-family: monospace; /* Often preferred for plain text */
-					white-space: pre-wrap; /* Preserves whitespace and wraps long lines */
-					word-wrap: break-word; /* Breaks long words if they don't fit */
+					font-family: monospace;
+					white-space: pre-wrap;
+					word-wrap: break-word;
 				}}
 			</style>
 		</head>
 		<body>
-			<div>{plain_text_content}</div>
+			<div>{escaped}</div>
 		</body>
 		</html>
 		"""
@@ -298,160 +876,134 @@ def convert_word_to_pdf_no_markup(input_file_path, output_pdf_path=None):
 		pythoncom.CoUninitialize()
 
 
-def extract_words_with_styles(pdf_document):
+def extract_words_with_styles(
+	pdf_document,
+	ignore_ligatures=False,
+	split_punctuation=True,
+	merge_hyphenation=True,
+):
 	"""
-	Extracts all words from a PyMuPDF document with their coordinates and styles.
-	Returns a list of dictionaries, each containing word information.
-	Adds 'unique_id' and 'highlight_color' (initially None) to each word.
+	Extracts all words from a PyMuPDF document with their coordinates.
+	Uses dict block/line order for reading order, with scaled line tolerance.
 	"""
 	all_words_data = []
-	LINE_TOLERANCE_Y = 3# works well with small font; might be improved scaling tolerance with the font size
 
 	for page_num, page in enumerate(pdf_document):
 		page.remove_rotation()
-		if app.ignore_ligatures.get():
-			words_data = page.get_text("words", flags=0)
+		if ignore_ligatures:
+			words_raw = page.get_text("words", flags=0)
+			text_dict = page.get_text("dict", flags=0)
 		else:
-			words_data = page.get_text("words")
-		top_left_in_block=dict()
-		
-		grouped_lines = []
-		for word_info in words_data:
-			x0, y0, x1, y1, word_text, block_no, _, _ = word_info[:8]  # Extract block_no
-			word_center_y = (y0 + y1) / 2
-			added_to_existing_line = False
-			
-			if block_no not in top_left_in_block:
-				top_left_in_block[block_no]=x0,y0
-			else:
-				if y0<top_left_in_block[block_no][1] or (y0==top_left_in_block[block_no][1] and x0<top_left_in_block[block_no][0]):
-					top_left_in_block[block_no]=x0,y0
+			words_raw = page.get_text("words")
+			text_dict = page.get_text("dict")
+		if not words_raw:
+			continue
 
-			for line_group in grouped_lines:
-				# Check if the word belongs to an existing line AND the same block
-				if abs(line_group['y_center'] - word_center_y) < LINE_TOLERANCE_Y and line_group['block_no'] == block_no:
-					line_group['words'].append(word_info)
-					line_group['y_center'] = sum((w[1] + w[3]) / 2 for w in line_group['words']) / len(line_group['words'])
-					added_to_existing_line = True
-					break
-
-			if not added_to_existing_line:
-				grouped_lines.append({
-					'y_center': word_center_y,
-					'words': [word_info],
-					'block_no': block_no  # Store block_no with the line group
+		ordered_lines = []
+		for block_idx, block in enumerate(text_dict.get("blocks", [])):
+			if block.get("type") != 0:
+				continue
+			for line_idx, line in enumerate(block.get("lines", [])):
+				bbox = line["bbox"]
+				ordered_lines.append({
+					"block_idx": block_idx,
+					"line_idx": line_idx,
+					"bbox": fitz.Rect(bbox),
+					"sort_y": bbox[1],
+					"sort_x": bbox[0],
 				})
 
+		heights = [w[3] - w[1] for w in words_raw if w[3] > w[1]]
+		median_height = sorted(heights)[len(heights) // 2] if heights else 12.0
+		line_tolerance = max(3.0, median_height * 0.35)
 
+		if not ordered_lines:
+			ordered_lines = [{
+				"block_idx": 0,
+				"line_idx": 0,
+				"bbox": fitz.Rect(words_raw[0][0], words_raw[0][1], words_raw[0][2], words_raw[0][3]),
+				"sort_y": words_raw[0][1],
+				"sort_x": words_raw[0][0],
+			}]
 
+		line_words = defaultdict(list)
+		for word_info in words_raw:
+			x0, y0, x1, y1, word_text = word_info[:5]
+			word_cy = (y0 + y1) / 2
+			best_line = None
+			best_dist = float("inf")
+			for li, line in enumerate(ordered_lines):
+				lb = line["bbox"]
+				if lb.y0 - line_tolerance <= word_cy <= lb.y1 + line_tolerance:
+					dist = abs(word_cy - (lb.y0 + lb.y1) / 2)
+					if dist < best_dist:
+						best_dist = dist
+						best_line = li
+			if best_line is None:
+				ordered_lines.append({
+					"block_idx": 9999,
+					"line_idx": len(ordered_lines),
+					"bbox": fitz.Rect(x0, y0, x1, y1),
+					"sort_y": y0,
+					"sort_x": x0,
+				})
+				best_line = len(ordered_lines) - 1
+			line_words[best_line].append(word_info)
 
-		# Sort grouped_lines first by block_no (these sorted from top left, to bottom right), then by y_center
-		grouped_lines.sort(key=lambda lg: (top_left_in_block[lg['block_no']][1],top_left_in_block[lg['block_no']][0], lg['y_center']))
+		def line_order_key(li):
+			line = ordered_lines[li]
+			return (line["sort_y"], line["sort_x"], line["block_idx"], line["line_idx"])
 
-		for line_group in grouped_lines:
-			line_group['words'].sort(key=lambda w: w[0])  # Sort words within the line by x0
-			for word_info in line_group['words']:
-				x0, y0, x1, y1, word_text, _, _, _ = word_info[:8]
-				current_font_family = ""
-				current_font_size = 12
-				current_font_color = "#000000"
-				current_font_weight = "normal"
-				current_font_style = "normal"
-
-				all_words_data.append({
+		page_words = []
+		for li in sorted(line_words.keys(), key=line_order_key):
+			line_meta = ordered_lines[li]
+			for word_info in sorted(line_words[li], key=lambda w: w[0]):
+				x0, y0, x1, y1, word_text = word_info[:5]
+				page_words.append({
 					"text": word_text,
 					"x0": x0, "y0": y0, "x1": x1, "y1": y1,
 					"page_num": page_num,
-					"font_family": current_font_family,
-					"font_size": current_font_size,
-					"font_color": current_font_color,
-					"font_weight": current_font_weight,
-					"font_style": current_font_style,
+					"block_idx": line_meta["block_idx"],
+					"line_idx": line_meta["line_idx"],
+					"font_family": "",
+					"font_size": median_height,
+					"font_color": "#000000",
+					"font_weight": "normal",
+					"font_style": "normal",
 					"unique_id": None,
-					"highlight_color": None
+					"highlight_color": None,
+					"move_id": None,
+					"move_side": None,
+					"chunk_id": 0,
 				})
+
+		page_words = postprocess_page_words(
+			page_words,
+			split_punctuation=split_punctuation,
+			merge_hyphenation=merge_hyphenation,
+		)
+		all_words_data.extend(page_words)
+
+	assign_chunk_ids(all_words_data)
 	return all_words_data
 
 def helper_case_quotes(words_data1, words_data2, case_insensitive, ignore_quotes):
-	a_compare = [word_info["text"] for word_info in words_data1]
-	b_compare = [word_info["text"] for word_info in words_data2]
-	if case_insensitive:
-		a_compare = [word.lower() for word in a_compare]
-		b_compare = [word.lower() for word in b_compare]
-	if ignore_quotes:
-		a_compare = [word.replace("‘", "'").replace("’", "'").replace("ʼ", "'").replace('“', '"').replace('”', '"') for word in a_compare]
-		b_compare = [word.replace("‘", "'").replace("’", "'").replace("ʼ", "'").replace('“', '"').replace('”', '"') for word in b_compare]
-	return a_compare,b_compare
+	a_compare = [
+		normalize_token(word_info["text"], case_insensitive, ignore_quotes)
+		for word_info in words_data1
+	]
+	b_compare = [
+		normalize_token(word_info["text"], case_insensitive, ignore_quotes)
+		for word_info in words_data2
+	]
+	return a_compare, b_compare
 
-def align_words_with_difflib(words_data1, words_data2, case_insensitive, ignore_quotes):#difflib (standard, uses Ratcliff-Obershelp algorithm)
-	import time
-	print(time.time(), "inizio align_words_with_difflib")
-	"""
-	Aligns two sequences of words using difflib.SequenceMatcher
-	and assigns common IDs or marks as unique.
-	Modifies words_data1 and words_data2 in place by setting 'unique_id'
-	and 'highlight_color'.
-	Args:
-		words_data1 (list): List of dictionaries for words in document 1.
-		words_data2 (list): List of dictionaries for words in document 2.
-		case_insensitive (bool): If True, comparisons ignore case.
-		ignore_quotes (bool): If True, various quote types are normalized to standard quotes.
-	"""
+def align_words_with_difflib(words_data1, words_data2, case_insensitive, ignore_quotes):
+	"""Aligns two word sequences using difflib.SequenceMatcher (Ratcliff-Obershelp)."""
 	a_compare, b_compare = helper_case_quotes(words_data1, words_data2, case_insensitive, ignore_quotes)
 	s = difflib.SequenceMatcher(None, a_compare, b_compare)
-	common_word_id_counter = 0
-	idx1_current = 0
-	idx2_current = 0
-	
-	# log=open("outlog.txt","w", encoding="utf8")
-	
-	
-	
-	for tag, i1, i2, j1, j2 in s.get_opcodes():
-		
-		
-		# sx=" ".join([x["text"] for x in words_data1[i1:i2]])
-		# dx=" ".join([x["text"] for x in words_data2[j1:j2]])
-		#if len(sx)>85: sx=sx[:40]+"..."+sx[-40:]
-		#if len(dx)>85: dx=dx[:40]+"..."+dx[-40:]
-		# try:
-			# log.write(f"{tag}\t{i1}\t{i2}\t{j1}\t{j2}\t{sx}\t{" -> "}\t{dx}\n")
-		# except:
-			# traceback.print_exc()
-			# raise
-		
-		
-		
-		if tag == 'equal':
-			for k in range(i2 - i1):
-				common_id = f"common-word-{common_word_id_counter}"
-				words_data1[idx1_current + k]["unique_id"] = common_id
-				words_data2[idx2_current + k]["unique_id"] = common_id
-				words_data1[idx1_current + k]["highlight_color"] = None
-				words_data2[idx2_current + k]["highlight_color"] = None
-				common_word_id_counter += 1
-			idx1_current += (i2 - i1)
-			idx2_current += (j2 - j1)
-		elif tag == 'delete': 
-			for k in range(i2 - i1):
-				words_data1[idx1_current + k]["unique_id"] = None
-				words_data1[idx1_current + k]["highlight_color"] = "red"
-			idx1_current += (i2 - i1)
-		elif tag == 'insert': 
-			for k in range(j2 - j1):
-				words_data2[idx2_current + k]["unique_id"] = None
-				words_data2[idx2_current + k]["highlight_color"] = "green"
-			idx2_current += (j2 - j1)
-		elif tag == 'replace': 
-			for k in range(i2 - i1):
-				words_data1[idx1_current + k]["unique_id"] = None
-				words_data1[idx1_current + k]["highlight_color"] = "red"
-			for k in range(j2 - j1):
-				words_data2[idx2_current + k]["unique_id"] = None
-				words_data2[idx2_current + k]["highlight_color"] = "green"
-			idx1_current += (i2 - i1)
-			idx2_current += (j2 - j1)
-	print(time.time(), "fine align_words_with_difflib")
+	opcodes = list(s.get_opcodes())
+	words_data1, words_data2, _ = apply_opcodes_to_words(words_data1, words_data2, opcodes, with_moves=False)
 	return words_data1, words_data2
 def apply_annotations_to_pdf_pages(pdf_document, words_data):
 	if not pdf_document or pdf_document.is_closed:
@@ -522,24 +1074,32 @@ def apply_annotations_to_pdf_pages(pdf_document, words_data):
 
 
 class GitSequenceMatcher:
-	def __init__(self, a, b, temp_dir=None):
+	GIT_COLOR_CONFIG = [
+		"-c", "color.ui=always",
+		"-c", "color.diff.old=red",
+		"-c", "color.diff.new=green",
+		"-c", "color.diff.meta=yellow",
+	]
+
+	def __init__(self, a, b, temp_dir=None, git_executable=None):
 		self.a = a
 		self.b = b
 		self.temp_file_a = None
 		self.temp_file_b = None
-		self.temp_dir = temp_dir
+		self.temp_dir = temp_dir or TEMP_PDF_DIR
+		self.git_executable = git_executable or find_git_executable()
 
 	def _create_temp_files(self):
-		"""Creates temporary files with repr() of each item in the input sequences."""
-		with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8', dir=self.temp_dir) as f_a:
+		"""Creates temporary files with one JSON-encoded token per line."""
+		with tempfile.NamedTemporaryFile(mode="w+", delete=False, encoding="utf-8", dir=self.temp_dir) as f_a:
 			self.temp_file_a = f_a.name
 			for item in self.a:
-				f_a.write(repr(item) + '\n')
+				f_a.write(json.dumps(item, ensure_ascii=True) + "\n")
 
-		with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8', dir=self.temp_dir) as f_b:
+		with tempfile.NamedTemporaryFile(mode="w+", delete=False, encoding="utf-8", dir=self.temp_dir) as f_b:
 			self.temp_file_b = f_b.name
 			for item in self.b:
-				f_b.write(repr(item) + '\n')
+				f_b.write(json.dumps(item, ensure_ascii=True) + "\n")
 
 	def _cleanup_temp_files(self):
 		"""Removes the temporary files."""
@@ -558,20 +1118,18 @@ class GitSequenceMatcher:
 		start_time=time.time()
 		try:
 			command = [
-				'git',
-				'--no-pager',
-				'diff',
-				'--no-index',
-				'--no-ext-diff',
-				#'--diff-algorithm=myers',
-				#'--diff-algorithm=minimal',
-				#'--diff-algorithm=patience',
-				'--diff-algorithm=histogram',
-				'--color=always',
-				'--color-moved',
-				'--unified=99999999',
+				self.git_executable,
+				*self.GIT_COLOR_CONFIG,
+				"--no-pager",
+				"diff",
+				"--no-index",
+				"--no-ext-diff",
+				"--diff-algorithm=histogram",
+				"--color=always",
+				"--color-moved",
+				"--unified=99999999",
 				self.temp_file_a,
-				self.temp_file_b
+				self.temp_file_b,
 			]
 			print(f"\nRunning command: {' '.join(command)}")
 			process = subprocess.run(
@@ -698,26 +1256,17 @@ class GitSequenceMatcher:
 			is_moved_flags = {} # (original_granular_idx) -> True
 
 			for content, candidates in moved_candidates.items():
-				deletes = [c for c in candidates if c[2] == 'moved_delete']
-				inserts = [c for c in candidates if c[2] == 'moved_insert']
-
-				# Attempt to pair up deletes and inserts of the same content
-				matched_deletes = set()
-				matched_inserts = set()
-
-				for d_a1, d_b1, d_tag, d_idx in deletes:
-					if d_idx in matched_deletes: continue # Already used
-
-					for i_a1, i_b1, i_tag, i_idx in inserts:
-						if i_idx in matched_inserts: continue # Already used
-
-						# If content matches and both are marked as moved_delete/insert by Git
-						# We consider them a 'move'
-						is_moved_flags[d_idx] = True
-						is_moved_flags[i_idx] = True
-						matched_deletes.add(d_idx)
-						matched_inserts.add(i_idx)
-						break # Found a match for this delete, move to next delete
+				deletes = sorted(
+					[c for c in candidates if c[2] == "moved_delete"],
+					key=lambda c: c[3],
+				)
+				inserts = sorted(
+					[c for c in candidates if c[2] == "moved_insert"],
+					key=lambda c: c[3],
+				)
+				for d_entry, i_entry in zip(deletes, inserts):
+					is_moved_flags[d_entry[3]] = True
+					is_moved_flags[i_entry[3]] = True
 
 			# --- Consolidation into difflib-style opcodes (with is_moved flag) ---
 			final_opcodes_pre_replace = []
@@ -802,8 +1351,7 @@ class GitSequenceMatcher:
 				consolidated_opcodes.append(current_op)
 				i += 1
 
-			# Final sort for consistent output order
-			opcodes = sorted(consolidated_opcodes, key=lambda x: (x[1], x[3]))
+			opcodes = consolidated_opcodes
 
 		except Exception as e:
 			print(f"An unexpected error occurred during parsing: {e}")
@@ -821,72 +1369,146 @@ class GitSequenceMatcher:
 
 def align_words_with_git_diff(words_data1, words_data2, case_insensitive, ignore_quotes):
 	a_compare, b_compare = helper_case_quotes(words_data1, words_data2, case_insensitive, ignore_quotes)
-	s = GitSequenceMatcher(a_compare, b_compare,temp_dir='.')
-	common_word_id_counter = 0
-	idx1_current = 0
-	idx2_current = 0
-	for tag, i1, i2, j1, j2, is_moved in s.get_opcodes():
-		# sx=" ".join([x["text"] for x in words_data1[i1:i2]])
-		# dx=" ".join([x["text"] for x in words_data2[j1:j2]])
-		if tag == 'equal':
-			for k in range(i2 - i1):
-				common_id = f"common-word-{common_word_id_counter}"
-				words_data1[idx1_current + k]["unique_id"] = common_id
-				words_data2[idx2_current + k]["unique_id"] = common_id
-				words_data1[idx1_current + k]["highlight_color"] = None
-				words_data2[idx2_current + k]["highlight_color"] = None
-				common_word_id_counter += 1
-			idx1_current += (i2 - i1)
-			idx2_current += (j2 - j1)
-		elif tag == 'delete' and not is_moved:
-			for k in range(i2 - i1):
-				words_data1[idx1_current + k]["unique_id"] = None
-				words_data1[idx1_current + k]["highlight_color"] = "red"
-			idx1_current += (i2 - i1)
-		elif tag == 'insert' and not is_moved:
-			for k in range(j2 - j1):
-				words_data2[idx2_current + k]["unique_id"] = None
-				words_data2[idx2_current + k]["highlight_color"] = "green"
-			idx2_current += (j2 - j1)
-		elif tag == 'replace':
-			for k in range(i2 - i1):
-				words_data1[idx1_current + k]["unique_id"] = None
-				words_data1[idx1_current + k]["highlight_color"] = "red"
-			for k in range(j2 - j1):
-				words_data2[idx2_current + k]["unique_id"] = None
-				words_data2[idx2_current + k]["highlight_color"] = "green"
-			idx1_current += (i2 - i1)
-			idx2_current += (j2 - j1)
-		elif tag == 'insert' and is_moved: 
-			for k in range(j2 - j1):
-				words_data2[idx2_current + k]["unique_id"] = None 
-				words_data2[idx2_current + k]["highlight_color"] = "blue"
-				#print(idx2_current + k,words_data2[idx2_current + k]["text"])
-			idx2_current += (j2 - j1)
-		elif tag == 'delete' and is_moved:
-			for k in range(i2 - i1):
-				words_data1[idx1_current + k]["unique_id"] = None
-				words_data1[idx1_current + k]["highlight_color"] = "blue"
-			idx1_current += (i2 - i1)
+	s = GitSequenceMatcher(a_compare, b_compare, temp_dir=TEMP_PDF_DIR)
+	opcodes = s.get_opcodes()
+	if not opcodes:
+		print("Git diff produced no opcodes; falling back to difflib.")
+		return align_words_with_difflib(words_data1, words_data2, case_insensitive, ignore_quotes)
+	words_data1, words_data2, _ = apply_opcodes_to_words(words_data1, words_data2, opcodes, with_moves=True)
 	return words_data1, words_data2
 
 def is_git_diff_available():
-	"""
-	Checks if git diff is available by running it with --quiet.
-	"""
+	"""Checks if git diff --no-index is available."""
+	git_exe = find_git_executable()
+	if git_exe == "git" and not shutil.which("git"):
+		return False
 	try:
-		subprocess.run(['git', 'diff'], check=False,  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-		return True
-	except (subprocess.CalledProcessError, FileNotFoundError):
+		result = subprocess.run(
+			[git_exe, "--version"],
+			capture_output=True,
+			text=True,
+			timeout=10,
+		)
+		return result.returncode == 0
+	except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
 		return False
 
 
-if is_git_diff_available():
-	align_words=align_words_with_git_diff
+_git_available = is_git_diff_available()
+if _git_available:
 	print("git diff command available")
 else:
-	align_words=align_words_with_difflib
 	print("git diff command not available; defaulting to difflib")
+
+
+def get_word_level_opcodes(a_compare, b_compare):
+	"""Return word-level diff opcodes and whether move flags are present."""
+	if _git_available:
+		opcodes = GitSequenceMatcher(a_compare, b_compare, temp_dir=TEMP_PDF_DIR).get_opcodes()
+		if opcodes:
+			return opcodes, True
+	s = difflib.SequenceMatcher(None, a_compare, b_compare)
+	return [(*opcode, False) for opcode in s.get_opcodes()], False
+
+
+def align_word_range(words_data1, words_data2, s1, e1, s2, e2, case_insensitive, ignore_quotes, id_counter):
+	"""Run word-level alignment on index ranges within two word lists."""
+	sub1 = words_data1[s1:e1]
+	sub2 = words_data2[s2:e2]
+	if not sub1 and not sub2:
+		return id_counter
+	a_compare, b_compare = helper_case_quotes(sub1, sub2, case_insensitive, ignore_quotes)
+	raw_opcodes, with_moves = get_word_level_opcodes(a_compare, b_compare)
+	global_opcodes = []
+	for op in raw_opcodes:
+		if with_moves:
+			tag, i1, i2, j1, j2, is_moved = op
+			global_opcodes.append((tag, s1 + i1, s1 + i2, s2 + j1, s2 + j2, is_moved))
+		else:
+			tag, i1, i2, j1, j2 = op[:5]
+			global_opcodes.append((tag, s1 + i1, s1 + i2, s2 + j1, s2 + j2))
+	_, _, id_counter = apply_opcodes_to_words(
+		words_data1, words_data2, global_opcodes,
+		with_moves=with_moves, reset=False, id_counter_start=id_counter,
+	)
+	return id_counter
+
+
+def align_words_chunked(words_data1, words_data2, case_insensitive, ignore_quotes):
+	"""Two-pass diff: align paragraph chunks, then word-diff inside each matched pair."""
+	chunks1 = group_word_ranges_by_chunk_id(words_data1)
+	chunks2 = group_word_ranges_by_chunk_id(words_data2)
+	if len(chunks1) <= 1 and len(chunks2) <= 1:
+		return align_words_single_pass(words_data1, words_data2, case_insensitive, ignore_quotes)
+
+	sigs1 = [chunk_compare_text(words_data1, s, e, case_insensitive, ignore_quotes) for s, e in chunks1]
+	sigs2 = [chunk_compare_text(words_data2, s, e, case_insensitive, ignore_quotes) for s, e in chunks2]
+	chunk_matcher = difflib.SequenceMatcher(None, sigs1, sigs2)
+	id_counter = 0
+
+	for w in words_data1:
+		w["unique_id"] = None
+		w["highlight_color"] = None
+	for w in words_data2:
+		w["unique_id"] = None
+		w["highlight_color"] = None
+
+	for tag, i1, i2, j1, j2 in chunk_matcher.get_opcodes():
+		if tag == "equal":
+			for offset in range(i2 - i1):
+				s1, e1 = chunks1[i1 + offset]
+				s2, e2 = chunks2[j1 + offset]
+				id_counter = align_word_range(
+					words_data1, words_data2, s1, e1, s2, e2,
+					case_insensitive, ignore_quotes, id_counter,
+				)
+		elif tag == "delete":
+			for ci in range(i1, i2):
+				start, end = chunks1[ci]
+				for idx in range(start, end):
+					words_data1[idx]["highlight_color"] = "red"
+		elif tag == "insert":
+			for cj in range(j1, j2):
+				start, end = chunks2[cj]
+				for idx in range(start, end):
+					words_data2[idx]["highlight_color"] = "green"
+		elif tag == "replace":
+			left_count = i2 - i1
+			right_count = j2 - j1
+			pairs = min(left_count, right_count)
+			for k in range(pairs):
+				s1, e1 = chunks1[i1 + k]
+				s2, e2 = chunks2[j1 + k]
+				id_counter = align_word_range(
+					words_data1, words_data2, s1, e1, s2, e2,
+					case_insensitive, ignore_quotes, id_counter,
+				)
+			for ci in range(i1 + pairs, i2):
+				start, end = chunks1[ci]
+				for idx in range(start, end):
+					words_data1[idx]["highlight_color"] = "red"
+			for cj in range(j1 + pairs, j2):
+				start, end = chunks2[cj]
+				for idx in range(start, end):
+					words_data2[idx]["highlight_color"] = "green"
+	return words_data1, words_data2
+
+
+def align_words_single_pass(words_data1, words_data2, case_insensitive, ignore_quotes):
+	"""Single-pass word alignment using git diff or difflib."""
+	a_compare, b_compare = helper_case_quotes(words_data1, words_data2, case_insensitive, ignore_quotes)
+	opcodes, with_moves = get_word_level_opcodes(a_compare, b_compare)
+	words_data1, words_data2, _ = apply_opcodes_to_words(
+		words_data1, words_data2, opcodes, with_moves=with_moves,
+	)
+	return words_data1, words_data2
+
+
+def align_words(words_data1, words_data2, case_insensitive, ignore_quotes, use_chunked=True):
+	"""Align two documents at word level, optionally using chunk-then-word diff."""
+	if use_chunked:
+		return align_words_chunked(words_data1, words_data2, case_insensitive, ignore_quotes)
+	return align_words_single_pass(words_data1, words_data2, case_insensitive, ignore_quotes)
 
 
 
@@ -895,6 +1517,7 @@ class PDFViewerPane:
 	BUFFER_PAGES = 3  
 	def __init__(self, master, parent_app, pane_id):
 		self.sorted=None
+		self.words_by_unique_id = None
 		self.master = master
 		self.parent_app = parent_app
 		self.pane_id = pane_id
@@ -1178,11 +1801,16 @@ class PDFViewerPane:
 				else:
 					return None, [], None, "Conversion Failed"
 			pdf_document_obj = fitz.open(file_path)
-			words_data_obj = extract_words_with_styles(pdf_document_obj)
+			ignore_ligatures = self.parent_app.ignore_ligatures.get()
+			words_data_obj = extract_words_with_styles(
+				pdf_document_obj,
+				ignore_ligatures=ignore_ligatures,
+				split_punctuation=self.parent_app.split_punctuation.get(),
+				merge_hyphenation=self.parent_app.merge_hyphenation.get(),
+			)
 			if file_path.find("clipboard_temp_")!=-1: temp_pdf_path_used=file_path
 			return pdf_document_obj, words_data_obj, temp_pdf_path_used, None 
 		except Exception as e:
-			raise
 			print(f"Error in load_pdf_internal: {e}")
 			if temp_pdf_path_used and os.path.exists(temp_pdf_path_used):
 				try:
@@ -1515,7 +2143,9 @@ class PDFViewerPane:
 				print(f"Pane {self.pane_id}: Error closing PDF document: {e}")
 			self.pdf_document = None 
 		self.file_name = None 
-		self.rendered_page_cache.clear() 
+		self.sorted = None
+		self.words_by_unique_id = None
+		self.rendered_page_cache.clear()
 		self.words_data = [] 
 		self.page_layout_info = {} 
 		self.canvas.delete("all") 
@@ -1547,6 +2177,9 @@ class PDFViewerApp:
 		self.case_insensitive = tk.BooleanVar(value=True)
 		self.ignore_quotes = tk.BooleanVar(value=True)
 		self.ignore_ligatures = tk.BooleanVar(value=True)
+		self.split_punctuation = tk.BooleanVar(value=True)
+		self.merge_hyphenation = tk.BooleanVar(value=True)
+		self.chunk_compare = tk.BooleanVar(value=True)
 		self.setup_ui() 
 		self.update_window_title() 
 		self.master.after_idle(self.update_ui_state)
@@ -1559,6 +2192,10 @@ class PDFViewerApp:
 		self.scroll_height=0
 		self.scroll_target_y=0
 		self.scroll_distance=0
+		self._compare_in_progress = False
+		self._compare_thread = None
+		self.words_data_original = [None, None]
+		self.change_records = None
 
 	def setup_ui(self):
 		"""Sets up the main application UI, including control frame and viewer panes."""
@@ -1584,6 +2221,12 @@ class PDFViewerApp:
 		self.prev_change_button.pack(side=tk.LEFT, padx=(20, 5))
 		self.next_change_button = ttk.Button(control_frame, text="Next", command=self.go_to_next_change, underline=0)
 		self.next_change_button.pack(side=tk.LEFT, padx=5)
+		self.recompare_button = ttk.Button(control_frame, text="Re-compare", command=self.recompare_documents)
+		self.recompare_button.pack(side=tk.LEFT, padx=5)
+		self.export_changes_button = ttk.Button(
+			control_frame, text="Export changes", command=self.export_change_records_dialog,
+		)
+		self.export_changes_button.pack(side=tk.LEFT, padx=5)
 		self.sync_scroll_checkbox = ttk.Checkbutton(control_frame, text="Sync Scroll",
 													variable=self.sync_scroll_enabled, onvalue=True, offvalue=False)
 		self.sync_scroll_checkbox.pack(side=tk.LEFT, padx=(20, 5))
@@ -1593,15 +2236,42 @@ class PDFViewerApp:
 		self.case_insensitive_checkbox = ttk.Checkbutton(control_frame, text="Case Insensitive",
 												  variable=self.case_insensitive, onvalue=True, offvalue=False)
 		self.case_insensitive_checkbox.pack(side=tk.LEFT, padx=5)
-		self.tip_case_insensitive = Hovertip(self.case_insensitive_checkbox,'Works only BEFORE loading files.\nLoad again one file if you need to change this setting.')
+		self.tip_case_insensitive = ToolTip(
+			self.case_insensitive_checkbox,
+			"Applied when comparing. Use Re-compare after changing.",
+		)
 		self.ignore_quotes_checkbox = ttk.Checkbutton(control_frame, text="Ignore quotes type",
 												  variable=self.ignore_quotes, onvalue=True, offvalue=False)
 		self.ignore_quotes_checkbox.pack(side=tk.LEFT, padx=5)
-		self.tip_ignore_quotes = Hovertip(self.ignore_quotes_checkbox,'Works only BEFORE loading files.\nLoad again one file if you need to change this setting.')
+		self.tip_ignore_quotes = ToolTip(
+			self.ignore_quotes_checkbox,
+			"Applied when comparing. Use Re-compare after changing.",
+		)
 		self.ignore_ligatures_checkbox = ttk.Checkbutton(control_frame, text="Ignore 'f' ligatures",
 												  variable=self.ignore_ligatures, onvalue=True, offvalue=False)
 		self.ignore_ligatures_checkbox.pack(side=tk.LEFT, padx=5)
-		self.tip_ignore_ligatures = Hovertip(self.ignore_ligatures_checkbox,'Works only BEFORE loading files.\nLoad again one file if you need to change this setting.')
+		self.tip_ignore_ligatures = ToolTip(
+			self.ignore_ligatures_checkbox,
+			"Applied when extracting text. Reload files after changing.",
+		)
+		self.split_punctuation_checkbox = ttk.Checkbutton(
+			control_frame, text="Split punct.",
+			variable=self.split_punctuation, onvalue=True, offvalue=False,
+		)
+		self.split_punctuation_checkbox.pack(side=tk.LEFT, padx=5)
+		ToolTip(self.split_punctuation_checkbox, "Split attached punctuation when extracting. Reload files after changing.")
+		self.merge_hyphenation_checkbox = ttk.Checkbutton(
+			control_frame, text="Merge hyphens",
+			variable=self.merge_hyphenation, onvalue=True, offvalue=False,
+		)
+		self.merge_hyphenation_checkbox.pack(side=tk.LEFT, padx=5)
+		ToolTip(self.merge_hyphenation_checkbox, "Merge line-break hyphenations when extracting. Reload files after changing.")
+		self.chunk_compare_checkbox = ttk.Checkbutton(
+			control_frame, text="Chunk diff",
+			variable=self.chunk_compare, onvalue=True, offvalue=False,
+		)
+		self.chunk_compare_checkbox.pack(side=tk.LEFT, padx=5)
+		ToolTip(self.chunk_compare_checkbox, "Two-pass paragraph-then-word compare. Use Re-compare after changing.")
 		self.panes_container = ttk.Frame(self.master)
 		self.panes_container.pack(fill=tk.BOTH, expand=True)
 		self.pane1 = PDFViewerPane(self.panes_container, self, 'left')
@@ -1654,6 +2324,10 @@ class PDFViewerApp:
 		self.zoom_scale_2.config(state=tk.NORMAL if doc2_loaded else tk.DISABLED)
 		self.prev_change_button.config(state=tk.NORMAL if (doc1_loaded and doc2_loaded) else tk.DISABLED)
 		self.next_change_button.config(state=tk.NORMAL if (doc1_loaded and doc2_loaded) else tk.DISABLED)
+		self.recompare_button.config(state=tk.NORMAL if (doc1_loaded and doc2_loaded and not self._compare_in_progress) else tk.DISABLED)
+		self.export_changes_button.config(
+			state=tk.NORMAL if (doc1_loaded and doc2_loaded and self.change_records is not None) else tk.DISABLED
+		)
 		self.update_zoom_label('left', self.pane1.zoom_level if doc1_loaded else 1.0)
 		self.update_zoom_label('right', self.pane2.zoom_level if doc2_loaded else 1.0)
 	def open_pdf(self, pane_index):
@@ -1726,7 +2400,8 @@ class PDFViewerApp:
 		pane.temp_pdf_path = temp_path
 		pane.file_name = display_file_name 
 		self.pdf_documents[pane_index] = pdf_doc
-		self.words_data_list[pane_index] = [dict(w) for w in words_data] 
+		self.words_data_list[pane_index] = [dict(w) for w in words_data]
+		self.words_data_original[pane_index] = [dict(w) for w in words_data]
 		pane.calculate_document_layout()
 		pane.canvas.yview_moveto(0) 
 		pane.canvas.xview_moveto(0) 
@@ -1736,36 +2411,143 @@ class PDFViewerApp:
 		self.perform_comparison_if_ready() 
 		pane.canvas.focus_set() 
 	def perform_comparison_if_ready(self):
-		"""
-		Performs a word-by-word comparison if both PDF documents are loaded.
-		This must run on the main thread.
-		"""
+		"""Starts word-by-word comparison in a background thread when both PDFs are loaded."""
 		doc1_ready = self.pdf_documents[0] and not self.pdf_documents[0].is_closed if self.pdf_documents[0] else False
 		doc2_ready = self.pdf_documents[1] and not self.pdf_documents[1].is_closed if self.pdf_documents[1] else False
 		if doc1_ready and doc2_ready:
-			print("Both documents ready. Performing comparison...")
-			words1_copy = [dict(w) for w in self.words_data_list[0]] if self.words_data_list[0] else []
-			words2_copy = [dict(w) for w in self.words_data_list[1]] if self.words_data_list[1] else []
-			self.words_data_list[0], self.words_data_list[1] = align_words(
+			self._start_comparison_thread()
+		else:
+			print("Waiting for both documents to be ready for comparison.")
+		self.update_ui_state()
+
+	def recompare_documents(self):
+		"""Re-runs comparison using cached word data and current compare options."""
+		doc1_ready = self.pdf_documents[0] and not self.pdf_documents[0].is_closed if self.pdf_documents[0] else False
+		doc2_ready = self.pdf_documents[1] and not self.pdf_documents[1].is_closed if self.pdf_documents[1] else False
+		if doc1_ready and doc2_ready:
+			self._start_comparison_thread(reset_from_cache=True)
+		self.update_ui_state()
+
+	def _start_comparison_thread(self, reset_from_cache=False):
+		if self._compare_in_progress:
+			return
+		if reset_from_cache:
+			if self.words_data_list[0] is None or self.words_data_list[1] is None:
+				return
+		self._compare_in_progress = True
+		self.change_records = None
+		self.pane1.sorted = None
+		self.pane2.sorted = None
+		self.pane1.display_loading_message("Comparing...")
+		self.pane2.display_loading_message("Comparing...")
+		self.update_ui_state()
+		self._compare_thread = threading.Thread(
+			target=self._compare_threaded,
+			args=(reset_from_cache,),
+			daemon=True,
+		)
+		self._compare_thread.start()
+
+	def _compare_threaded(self, reset_from_cache=False):
+		try:
+			if reset_from_cache and self.words_data_original[0] and self.words_data_original[1]:
+				words1_copy = [dict(w) for w in self.words_data_original[0]]
+				words2_copy = [dict(w) for w in self.words_data_original[1]]
+			else:
+				words1_copy = [dict(w) for w in self.words_data_list[0]] if self.words_data_list[0] else []
+				words2_copy = [dict(w) for w in self.words_data_list[1]] if self.words_data_list[1] else []
+			words1_aligned, words2_aligned = align_words(
 				words1_copy, words2_copy,
 				self.case_insensitive.get(),
 				self.ignore_quotes.get(),
+				use_chunked=self.chunk_compare.get(),
 			)
-			self.pane1.words_data = self.words_data_list[0]
-			self.pane2.words_data = self.words_data_list[1]
-			apply_annotations_to_pdf_pages(self.pdf_documents[0], self.pane1.words_data)
-			apply_annotations_to_pdf_pages(self.pdf_documents[1], self.pane2.words_data)
-			self.pane1._clear_all_rendered_pages()
-			self.pane2._clear_all_rendered_pages()
-			self.pane1.render_visible_pages()
-			self.pane2.render_visible_pages()
-			if self.current_active_pane:
-				self.sync_scroll(self.current_active_pane)
-			else:
-				self.sync_scroll(self.pane1) 
+			self.master.after(0, lambda: self._on_compare_complete(words1_aligned, words2_aligned))
+		except Exception as e:
+			traceback.print_exc()
+			self.master.after(0, lambda: self._on_compare_failed(str(e)))
+
+	def _on_compare_complete(self, words1_aligned, words2_aligned):
+		self._compare_in_progress = False
+		self.pane1.hide_loading_message()
+		self.pane2.hide_loading_message()
+		self.pane1.sorted = None
+		self.pane2.sorted = None
+		self.pane1.words_by_unique_id = None
+		self.pane2.words_by_unique_id = None
+		self.words_data_list[0] = words1_aligned
+		self.words_data_list[1] = words2_aligned
+		self.pane1.words_data = words1_aligned
+		self.pane2.words_data = words2_aligned
+		apply_annotations_to_pdf_pages(self.pdf_documents[0], self.pane1.words_data)
+		apply_annotations_to_pdf_pages(self.pdf_documents[1], self.pane2.words_data)
+		self.pane1._clear_all_rendered_pages()
+		self.pane2._clear_all_rendered_pages()
+		self.pane1.render_visible_pages()
+		self.pane2.render_visible_pages()
+		if self.current_active_pane:
+			self.sync_scroll(self.current_active_pane)
 		else:
-			print("Waiting for both documents to be ready for comparison.")
-		self.update_ui_state() 
+			self.sync_scroll(self.pane1)
+		self._refresh_change_records(words1_aligned, words2_aligned)
+		self.update_ui_state()
+		print("Comparison complete.")
+
+	def _compare_options_dict(self):
+		return {
+			"case_insensitive": self.case_insensitive.get(),
+			"ignore_quotes": self.ignore_quotes.get(),
+			"ignore_ligatures": self.ignore_ligatures.get(),
+			"split_punctuation": self.split_punctuation.get(),
+			"merge_hyphenation": self.merge_hyphenation.get(),
+			"use_chunked": self.chunk_compare.get(),
+			"aligner": "git" if _git_available else "difflib",
+		}
+
+	def _refresh_change_records(self, words_left, words_right):
+		"""Build structured change records after a successful compare."""
+		self.change_records = build_change_records(
+			words_left, words_right,
+			left_name=self.pane1.file_name or "left",
+			right_name=self.pane2.file_name or "right",
+			case_insensitive=self.case_insensitive.get(),
+			ignore_quotes=self.ignore_quotes.get(),
+			compare_options=self._compare_options_dict(),
+		)
+		print(
+			f"Change records: {self.change_records['stats']['total']} hunks "
+			f"({self.change_records['stats']['added']} added, "
+			f"{self.change_records['stats']['deleted']} deleted, "
+			f"{self.change_records['stats']['modified']} modified, "
+			f"{self.change_records['stats']['moved']} moved)"
+		)
+
+	def export_change_records_dialog(self):
+		"""Save change records JSON for agent / reporting use."""
+		if not self.change_records:
+			messagebox.showinfo("Export Changes", "No comparison results to export. Compare two documents first.")
+			return
+		name1 = os.path.splitext(self.pane1.file_name or "left")[0]
+		name2 = os.path.splitext(self.pane2.file_name or "right")[0]
+		initial = f"{name1}_vs_{name2}_changes.json"
+		file_path = filedialog.asksaveasfilename(
+			defaultextension=".json",
+			filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+			initialfile=initial,
+		)
+		if file_path:
+			try:
+				write_change_records_json(self.change_records, file_path)
+				messagebox.showinfo("Export Changes", f"Change records saved to:\n{file_path}")
+			except Exception as e:
+				messagebox.showerror("Export Changes", f"Failed to save change records:\n{e}")
+
+	def _on_compare_failed(self, error_message):
+		self._compare_in_progress = False
+		self.pane1.hide_loading_message()
+		self.pane2.hide_loading_message()
+		messagebox.showerror("Compare Error", f"Comparison failed:\n{error_message}")
+		self.update_ui_state()
 	def on_pane_scrolled(self, event, source_pane):
 		"""Callback for when a user scrolls one of the PDF panes."""
 		if self.sync_scroll_enabled.get() and source_pane.pdf_document and not source_pane.pdf_document.is_closed:
@@ -1813,11 +2595,11 @@ class PDFViewerApp:
 						break 
 		if first_common_word_in_view:
 			common_word_id = first_common_word_in_view["unique_id"]
-			target_word_info = None
-			for word_info_target in target_pane.words_data:
-				if word_info_target["unique_id"] == common_word_id:
-					target_word_info = word_info_target
-					break
+			if not target_pane.words_by_unique_id:
+				target_pane.words_by_unique_id = {
+					w["unique_id"]: w for w in target_pane.words_data if w["unique_id"]
+				}
+			target_word_info = target_pane.words_by_unique_id.get(common_word_id)
 			#print(f"\nscroll direction: {source_y-prev_scroll_y}")# positive=we are scrolling down
 			#print("source y: ",source_y)
 			#print(f"source: {first_common_word_in_view["text"]}, {first_common_word_in_view["page_num"]}, {first_common_word_in_view["x0"]}, {first_common_word_in_view["y0"]},\ntarget: {target_word_info["text"]}, {target_word_info["page_num"]}, {target_word_info["x0"]}, {target_word_info["y0"]}")
@@ -2006,6 +2788,24 @@ class PDFViewerApp:
 
 
 if __name__ == "__main__":
+	if len(sys.argv) >= 5 and sys.argv[1] == "--export-changes":
+		output_json = sys.argv[2]
+		left_pdf = sys.argv[3]
+		right_pdf = sys.argv[4]
+		try:
+			records = compare_files_to_change_records(left_pdf, right_pdf)
+			write_change_records_json(records, output_json)
+			print(
+				f"Exported {records['stats']['total']} change(s): "
+				f"{records['stats']['added']} added, {records['stats']['deleted']} deleted, "
+				f"{records['stats']['modified']} modified, {records['stats']['moved']} moved."
+			)
+		except Exception as exc:
+			print(f"Export failed: {exc}", file=sys.stderr)
+			traceback.print_exc()
+			sys.exit(1)
+		sys.exit(0)
+
 	root = TkinterDnD.Tk()
 	app = PDFViewerApp(root)
 	root.protocol("WM_DELETE_WINDOW", app.on_closing)
