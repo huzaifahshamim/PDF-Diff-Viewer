@@ -1,0 +1,8 @@
+temp_pdfs/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+dist/
+build/
+*.spec
